@@ -17,7 +17,7 @@ load_dotenv()
 
 # Bot configuration
 UPDATE_CHANNEL_ID = os.getenv('UPDATE_CHANNEL_ID')  # Channel ID for updates
-BOT_VERSION = "2.1.0"  # Current bot version
+BOT_VERSION = "2.1.1"  # Current bot version
 LAST_UPDATE = "2025-10-21"  # Last update date
 
 # Configure logging
@@ -31,10 +31,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot configuration
+# Bot setup with voice support
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents.voice_states = True
+bot = commands.Bot(
+    command_prefix='!', 
+    intents=intents,
+    help_command=None,
+    case_insensitive=True
+)
 
 class VideoDownloader:
     def __init__(self):
@@ -250,6 +256,16 @@ async def on_ready():
     await send_automatic_update_notification()
 
 @bot.event
+async def on_disconnect():
+    """Clean up when bot disconnects"""
+    logger.info("Bot disconnecting - cleaning up voice connections")
+    for voice_client in bot.voice_clients:
+        try:
+            await voice_client.disconnect(force=True)
+        except Exception as e:
+            logger.warning(f"Error disconnecting voice client on shutdown: {str(e)}")
+
+@bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         await ctx.send("❌ أمر غير معروف! استخدم `!help` لرؤية الأوامر المتاحة")
@@ -434,18 +450,44 @@ async def text_to_speech(ctx, *, text: str = None):
             tts.save(tmp_file.name)
             audio_file = tmp_file.name
         
-        # Connect to voice channel
+        # Connect to voice channel with retry logic
         voice_client = None
-        if ctx.voice_client:
-            voice_client = ctx.voice_client
-            # Move to user's channel if in different channel
-            if voice_client.channel != voice_channel:
-                await voice_client.move_to(voice_channel)
-        else:
-            voice_client = await voice_channel.connect()
+        max_retries = 3
+        retry_count = 0
         
-        # Wait a moment for connection to stabilize
-        await asyncio.sleep(0.5)
+        while retry_count < max_retries:
+            try:
+                if ctx.voice_client:
+                    voice_client = ctx.voice_client
+                    # Move to user's channel if in different channel
+                    if voice_client.channel != voice_channel:
+                        await voice_client.move_to(voice_channel)
+                else:
+                    voice_client = await voice_channel.connect(timeout=10.0, reconnect=True)
+                
+                # Wait for connection to stabilize
+                await asyncio.sleep(1.0)
+                
+                # Test connection
+                if voice_client.is_connected():
+                    break
+                else:
+                    raise Exception("Connection test failed")
+                    
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"Voice connection attempt {retry_count} failed: {str(e)}")
+                
+                if voice_client:
+                    try:
+                        await voice_client.disconnect()
+                    except:
+                        pass
+                
+                if retry_count < max_retries:
+                    await asyncio.sleep(2.0)  # Wait before retry
+                else:
+                    raise Exception(f"Failed to connect to voice after {max_retries} attempts")
         
         # Play the audio
         if voice_client.is_playing():
@@ -481,15 +523,18 @@ async def text_to_speech(ctx, *, text: str = None):
         embed.color = 0x00ff00
         await loading_msg.edit(embed=embed)
         
-        # Disconnect after playing
-        if voice_client.is_connected():
-            await voice_client.disconnect()
+        # Disconnect after playing with proper cleanup
+        try:
+            if voice_client and voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+        except Exception as e:
+            logger.warning(f"Error disconnecting voice client: {str(e)}")
         
         # Clean up temporary file
         try:
             os.unlink(audio_file)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning up temp file: {str(e)}")
             
     except discord.errors.ClientException as e:
         # This is often a false error when audio finishes normally
@@ -506,10 +551,17 @@ async def text_to_speech(ctx, *, text: str = None):
             logger.error(f"Real TTS error: {str(e)}")
             await ctx.send(f"❌ خطأ في تحويل النص إلى كلام: {str(e)}")
         
-        # Disconnect if connected
+        # Disconnect if connected with proper cleanup
         try:
             if ctx.voice_client and ctx.voice_client.is_connected():
-                await ctx.voice_client.disconnect()
+                await ctx.voice_client.disconnect(force=True)
+        except Exception as e:
+            logger.warning(f"Error in cleanup disconnect: {str(e)}")
+        
+        # Clean up any remaining temp files
+        try:
+            if 'audio_file' in locals():
+                os.unlink(audio_file)
         except:
             pass
 
