@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build: .
+    container_name: video-downloader-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+    volumes:
+      - ./logs:/app/logs
+      - ./downloads:/app/downloads
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
