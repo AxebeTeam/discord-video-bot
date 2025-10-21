@@ -11,13 +11,15 @@ import json
 from dotenv import load_dotenv
 import gtts
 from io import BytesIO
+import signal
+import sys
 
 # Load environment variables
 load_dotenv()
 
 # Bot configuration
 UPDATE_CHANNEL_ID = os.getenv('UPDATE_CHANNEL_ID')  # Channel ID for updates
-BOT_VERSION = "2.1.1"  # Current bot version
+BOT_VERSION = "2.1.3"  # Current bot version
 LAST_UPDATE = "2025-10-21"  # Last update date
 
 # Configure logging
@@ -255,15 +257,36 @@ async def on_ready():
     # Send automatic update notification
     await send_automatic_update_notification()
 
+async def cleanup_connections():
+    """Clean up all connections and resources"""
+    logger.info("Starting cleanup process...")
+    
+    # Clean up voice connections
+    for voice_client in bot.voice_clients:
+        try:
+            if voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+                logger.info(f"Disconnected voice client from {voice_client.channel}")
+        except Exception as e:
+            logger.warning(f"Error disconnecting voice client: {str(e)}")
+    
+    # Clean up HTTP sessions
+    try:
+        if hasattr(bot, 'http') and bot.http.connector:
+            await bot.http.connector.close()
+            logger.info("HTTP connector closed")
+    except Exception as e:
+        logger.warning(f"Error closing HTTP connector: {str(e)}")
+    
+    # Wait for cleanup to complete
+    await asyncio.sleep(1.0)
+    logger.info("Cleanup process completed")
+
 @bot.event
 async def on_disconnect():
     """Clean up when bot disconnects"""
-    logger.info("Bot disconnecting - cleaning up voice connections")
-    for voice_client in bot.voice_clients:
-        try:
-            await voice_client.disconnect(force=True)
-        except Exception as e:
-            logger.warning(f"Error disconnecting voice client on shutdown: {str(e)}")
+    logger.info("Bot disconnecting - starting cleanup")
+    await cleanup_connections()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -457,22 +480,44 @@ async def text_to_speech(ctx, *, text: str = None):
         
         while retry_count < max_retries:
             try:
+                # Clean up any existing connection first
                 if ctx.voice_client:
-                    voice_client = ctx.voice_client
-                    # Move to user's channel if in different channel
-                    if voice_client.channel != voice_channel:
-                        await voice_client.move_to(voice_channel)
-                else:
-                    voice_client = await voice_channel.connect(timeout=10.0, reconnect=True)
+                    try:
+                        await ctx.voice_client.disconnect(force=True)
+                        await asyncio.sleep(1.0)  # Wait for cleanup
+                    except:
+                        pass
+                
+                # Fresh connection attempt
+                voice_client = await voice_channel.connect(timeout=15.0, reconnect=True)
                 
                 # Wait for connection to stabilize
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.0)
                 
                 # Test connection
                 if voice_client.is_connected():
+                    logger.info(f"Voice connection successful on attempt {retry_count + 1}")
                     break
                 else:
                     raise Exception("Connection test failed")
+                    
+            except discord.errors.ConnectionClosed as e:
+                retry_count += 1
+                if e.code == 4006:
+                    logger.warning(f"Voice session expired (4006) - attempt {retry_count}")
+                    await asyncio.sleep(3.0)  # Longer wait for session expiry
+                else:
+                    logger.warning(f"Voice connection closed ({e.code}) - attempt {retry_count}")
+                    await asyncio.sleep(2.0)
+                
+                if voice_client:
+                    try:
+                        await voice_client.disconnect(force=True)
+                    except:
+                        pass
+                
+                if retry_count >= max_retries:
+                    raise Exception(f"Voice connection failed after {max_retries} attempts: WebSocket closed with {e.code}")
                     
             except Exception as e:
                 retry_count += 1
@@ -480,14 +525,14 @@ async def text_to_speech(ctx, *, text: str = None):
                 
                 if voice_client:
                     try:
-                        await voice_client.disconnect()
+                        await voice_client.disconnect(force=True)
                     except:
                         pass
                 
                 if retry_count < max_retries:
                     await asyncio.sleep(2.0)  # Wait before retry
                 else:
-                    raise Exception(f"Failed to connect to voice after {max_retries} attempts")
+                    raise Exception(f"Failed to connect to voice after {max_retries} attempts: {str(e)}")
         
         # Play the audio
         if voice_client.is_playing():
@@ -542,21 +587,27 @@ async def text_to_speech(ctx, *, text: str = None):
         await ctx.send("✅ تم تشغيل الصوت بنجاح!")
         
     except Exception as e:
-        # Only show real errors
+        # Enhanced error handling with proper cleanup
         error_msg = str(e).lower()
-        if "not connected" in error_msg or "already playing" in error_msg:
+        
+        if "failed to connect to voice" in error_msg:
+            await ctx.send("❌ فشل الاتصال بالروم الصوتي. قد يكون الخادم مشغولاً، جرب مرة أخرى لاحقاً.")
+            logger.error(f"Voice connection failed: {str(e)}")
+        elif "not connected" in error_msg or "already playing" in error_msg:
             logger.info(f"Normal audio completion: {str(e)}")
             await ctx.send("✅ تم تشغيل الصوت بنجاح!")
         else:
             logger.error(f"Real TTS error: {str(e)}")
-            await ctx.send(f"❌ خطأ في تحويل النص إلى كلام: {str(e)}")
+            await ctx.send(f"❌ خطأ في تحويل النص إلى كلام. جرب مرة أخرى.")
         
-        # Disconnect if connected with proper cleanup
+        # Force cleanup all voice connections
         try:
-            if ctx.voice_client and ctx.voice_client.is_connected():
-                await ctx.voice_client.disconnect(force=True)
-        except Exception as e:
-            logger.warning(f"Error in cleanup disconnect: {str(e)}")
+            for voice_client in bot.voice_clients:
+                if voice_client.guild == ctx.guild:
+                    await voice_client.disconnect(force=True)
+                    logger.info(f"Force disconnected voice client from {voice_client.channel}")
+        except Exception as cleanup_error:
+            logger.warning(f"Error in force cleanup: {str(cleanup_error)}")
         
         # Clean up any remaining temp files
         try:
@@ -564,6 +615,9 @@ async def text_to_speech(ctx, *, text: str = None):
                 os.unlink(audio_file)
         except:
             pass
+        
+        # Wait for cleanup
+        await asyncio.sleep(1.0)
 
 @bot.command(name='join', aliases=['انضم'])
 async def join_voice(ctx):
@@ -574,19 +628,48 @@ async def join_voice(ctx):
     
     voice_channel = ctx.author.voice.channel
     
-    if ctx.voice_client:
-        await ctx.voice_client.move_to(voice_channel)
-        await ctx.send(f"🔊 تم الانتقال إلى {voice_channel.name}")
-    else:
-        await voice_channel.connect()
-        await ctx.send(f"🔊 تم الانضمام إلى {voice_channel.name}")
+    # Check bot permissions
+    permissions = voice_channel.permissions_for(ctx.guild.me)
+    if not permissions.connect or not permissions.speak:
+        await ctx.send("❌ ليس لدي صلاحية للانضمام أو التحدث في هذا الروم!")
+        return
+    
+    try:
+        if ctx.voice_client:
+            if ctx.voice_client.channel == voice_channel:
+                await ctx.send(f"✅ أنا موجود بالفعل في {voice_channel.name}")
+                return
+            else:
+                await ctx.voice_client.move_to(voice_channel)
+                await ctx.send(f"🔊 تم الانتقال إلى {voice_channel.name}")
+        else:
+            # Clean connection attempt
+            voice_client = await voice_channel.connect(timeout=15.0, reconnect=True)
+            await asyncio.sleep(1.0)  # Wait for stabilization
+            await ctx.send(f"🔊 تم الانضمام إلى {voice_channel.name}")
+            
+    except discord.errors.ConnectionClosed as e:
+        if e.code == 4006:
+            await ctx.send("❌ انتهت صلاحية الجلسة الصوتية. جرب مرة أخرى!")
+        else:
+            await ctx.send(f"❌ فشل الاتصال الصوتي (كود: {e.code})")
+        logger.error(f"Voice connection failed in join command: {str(e)}")
+        
+    except Exception as e:
+        await ctx.send(f"❌ خطأ في الانضمام للروم الصوتي: {str(e)}")
+        logger.error(f"Join voice error: {str(e)}")
 
 @bot.command(name='leave', aliases=['اخرج', 'غادر'])
 async def leave_voice(ctx):
     """Leave voice channel"""
     if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("👋 تم مغادرة الروم الصوتي")
+        try:
+            channel_name = ctx.voice_client.channel.name
+            await ctx.voice_client.disconnect(force=True)
+            await ctx.send(f"👋 تم مغادرة الروم الصوتي: {channel_name}")
+        except Exception as e:
+            await ctx.send("👋 تم قطع الاتصال الصوتي")
+            logger.warning(f"Error in leave command: {str(e)}")
     else:
         await ctx.send("❌ لست متصل بأي روم صوتي!")
 
@@ -731,6 +814,19 @@ async def show_version(ctx):
     
     await ctx.send(embed=embed)
 
+async def shutdown_handler():
+    """Handle graceful shutdown"""
+    logger.info("Shutdown signal received - starting graceful shutdown")
+    await cleanup_connections()
+    await bot.close()
+    logger.info("Bot shutdown completed")
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}")
+    loop = asyncio.get_event_loop()
+    loop.create_task(shutdown_handler())
+
 if __name__ == "__main__":
     # Get bot token from environment variable
     token = os.getenv('DISCORD_BOT_TOKEN')
@@ -739,10 +835,20 @@ if __name__ == "__main__":
         print("يرجى إضافة التوكن في ملف .env أو متغيرات البيئة")
         exit(1)
     
+    # Setup signal handlers for graceful shutdown
+    if sys.platform != 'win32':
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+    
     try:
         bot.run(token)
     except discord.LoginFailure:
         print("❌ خطأ في تسجيل الدخول: تأكد من صحة التوكن")
+        logger.error("Discord login failure - invalid token")
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received - shutting down")
     except Exception as e:
-        logger.error(f"Bot startup error: {str(e)}")
+        logger.error(f"Bot crashed: {str(e)}")
         print(f"❌ خطأ في تشغيل البوت: {str(e)}")
+    finally:
+        logger.info("Bot process ended")
